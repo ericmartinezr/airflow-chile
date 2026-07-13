@@ -12,6 +12,10 @@ logger = logging.getLogger(__name__)
 
 ENDPOINT_LICITACION = "https://api.mercadopublico.cl/servicios/v1/publico/licitaciones.json"
 
+# TODO: XCom backend
+# https://www.astronomer.io/docs/learn/custom-xcom-backend-strategies
+# https://www.astronomer.io/docs/learn/custom-xcom-backend-strategies#use-the-object-storage-xcom-backend
+
 
 @dag(
     start_date=datetime(2026, 1, 1),
@@ -20,8 +24,7 @@ ENDPOINT_LICITACION = "https://api.mercadopublico.cl/servicios/v1/publico/licita
     default_args={
         "owner": "emartinez",
         "retries": 1,
-        "retry_Delay": timedelta(seconds=10),
-        "pool": "mercadopublico_pool"
+        "retry_Delay": timedelta(seconds=10)
     },
     tags=["scrapping", "mercadopublico"],
 )
@@ -72,7 +75,8 @@ def mercado_publico():
     @task(
         max_active_tis_per_dag=1,
         retries=5,
-        retry_delay=timedelta(seconds=10)
+        retry_delay=timedelta(seconds=10),
+        pool="mp_licitacion_detail_pool"
     )
     def get_licitacion_detail(codigo: str) -> dict:
         logger.info(f"Codigo procesado: {codigo}")
@@ -165,10 +169,15 @@ def mercado_publico():
     def save_to_db(result: dict):
         if "is_error" in result and result["is_error"]:
             return None
+
         result["comprador"] = json.dumps(
-            result["comprador"], ensure_ascii=False)
+            result["comprador"],
+            ensure_ascii=False
+        )
         result["adjudicacion"] = json.dumps(
-            result["adjudicacion"], ensure_ascii=False)
+            result["adjudicacion"],
+            ensure_ascii=False
+        )
         result["items"] = json.dumps(result["items"], ensure_ascii=False)
         result["fechas"] = json.dumps(result["fechas"], ensure_ascii=False)
         return result
@@ -177,6 +186,7 @@ def mercado_publico():
     def save_to_dlq(result: dict):
         if "is_error" not in result or not result["is_error"]:
             return None
+
         return {
             "codigo_externo": result.get("codigo_externo"),
             "error_message": result.get("error_message"),
