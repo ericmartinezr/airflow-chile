@@ -1,50 +1,103 @@
 # Airflow Chile
 
-Este repositorio contendrá pipelines con Airflow para datos de Chile.
+Repositorio de pipelines con [Apache Airflow](https://airflow.apache.org/) para datos públicos de Chile. Utiliza [Astro Runtime](https://www.astronomer.io/docs/astro/runtime-image-architecture) como base del entorno de ejecución.
 
-Estado: trabajo en progreso (WIP).
+Estado: **trabajo en progreso (WIP)**.
+
+## Prerrequisitos
+
+- [Docker](https://docs.docker.com/get-docker/)
+- [Astro CLI](https://www.astronomer.io/docs/astro/cli/install-cli)
+- Cuenta de Google Cloud Platform (para XCom backend en GCS)
+- Base de datos PostgreSQL
 
 ## Iniciar ambiente
 
-> astro dev start
+```bash
+astro dev start
+```
 
 ## Reiniciar ambiente
 
-> astro dev restart
+```bash
+astro dev restart
+```
 
-# Mercado Público
+## Estructura del proyecto
 
-Debido a la la cantidad de licitaciones que pueden haber por día
-se incrementó el tamaño máximo que puede enviar una tarea a otro por medio de XCom ([`max_map_length`](https://airflow.apache.org/docs/apache-airflow/stable/configurations-ref.html#max-map-length)).
+```
+dags/
+├── mercado_publico.py        # DAG principal
+└── sql/
+    └── mercadopublico/       # Consultas SQL para upsert de licitaciones
+requirements.txt              # Dependencias de Python (proveedores de Airflow)
+Dockerfile                    # Imagen base: Astro Runtime
+.env                          # Variables de ambiente (no commitear)
+```
 
-Por otro lado, ya que la API cuenta con rate limiting (aprox 2 segundos entre consulta), se creó un pool específico para este DAG con el valor de 1, así evito que se ejecuten 2 o más consultas en paralelo.
+## DAGs
 
-También para no colapsar la BD (no debería ser un problema en todo caso) se habilitó un xcom storage en GCP.
+### Mercado Público
 
-## Variables
+Pipeline que extrae licitaciones publicadas en [Mercado Público](https://www.mercadopublico.cl/) y las almacena en PostgreSQL.
 
-- Agregar variable `API_MP` con el ticket de MercadoPublico´
+- **Schedule**: diario (`@daily`)
+- **Fecha de inicio**: 2026-01-01
+- **Tags**: `scrapping`, `mercadopublico`
 
-## Pools
+**Flujo general:**
 
-- Agregar pool `mp_licitacion_detail_pool` con valor 1
+1. Consulta la API de Mercado Público para obtener los códigos de las licitaciones del día anterior.
+2. Por cada código, consulta el detalle completo de la licitación (dynamic task mapping).
+3. Los resultados exitosos se serializan y hacen upsert en PostgreSQL.
+4. Los registros con error se envían a una tabla DLQ (_dead letter queue_) para revisión.
 
-## Conexiones
+**Consideraciones técnicas:**
 
-- Agregar conexión `airflow_cl_db` a PostgreSQL
-- Agregar conexión `my_gcp_conn` a Google Cloud (ver referencias [2])
+- Se incrementó [`max_map_length`](https://airflow.apache.org/docs/apache-airflow/stable/configurations-ref.html#max-map-length) a 2000 debido al alto volumen de licitaciones diarias.
+- La API tiene _rate limiting_ (~2 segundos entre consultas), por lo que se creó un pool dedicado con 1 slot para evitar consultas paralelas.
+- Se habilitó un XCom backend en Google Cloud Storage para no sobrecargar la base de datos con datos de XCom.
 
-## Variables de ambiente (.env)
+## Configuración
+
+### Variable
+
+| Variable | Descripción                                          |
+| -------- | ---------------------------------------------------- |
+| `API_MP` | Ticket de autenticación de la API de Mercado Público |
+
+### Pool
+
+| Pool                        | Slots | Descripción                                                        |
+| --------------------------- | ----- | ------------------------------------------------------------------ |
+| `mp_licitacion_detail_pool` | 1     | Control de concurrencia para consultas a la API de Mercado Público |
+
+### Conexiones
+
+| Conexión        | Tipo         | Descripción                                     |
+| --------------- | ------------ | ----------------------------------------------- |
+| `airflow_cl_db` | PostgreSQL   | Base de datos destino para las licitaciones     |
+| `my_gcp_conn`   | Google Cloud | Conexión a GCP (usada para XCom backend en GCS) |
+
+### Variables de ambiente (`.env`)
+
+Configurar las siguientes variables en el archivo `.env` en la raíz del proyecto:
 
 ```ini
 AIRFLOW__CORE__XCOM_BACKEND=airflow.providers.common.io.xcom.backend.XComObjectStorageBackend
-AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH=gs://my_gcp_conn@<bucket>/xcom
+AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH=gs://<conn_id>@<bucket>/xcom
 AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_COMPRESSION=zip
 AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_THRESHOLD=2000
 AIRFLOW__CORE__MAX_MAP_LENGTH=2000
 ```
 
-# Referencias
+Reemplazar `<conn_id>` y `<bucket>` con los valores correspondientes de la conexión GCP y el bucket de GCS.
+
+## Referencias
 
 1. https://www.astronomer.io/docs/learn/custom-xcom-backend-strategies
 2. https://www.astronomer.io/docs/learn/custom-xcom-backends-tutorial (GCP)
+
+---
+
+_Este archivo fue escrito inicialmente a mano y posteriormente mejorado con asistencia de IA._
