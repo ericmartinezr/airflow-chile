@@ -24,7 +24,7 @@ ENDPOINT_LICITACION = "https://api.mercadopublico.cl/servicios/v1/publico/licita
     default_args={
         "owner": "emartinez",
         "retries": 1,
-        "retry_Delay": timedelta(seconds=10)
+        "retry_delay": timedelta(seconds=10)
     },
     tags=["scrapping", "mercadopublico"],
 )

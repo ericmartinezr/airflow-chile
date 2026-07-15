@@ -12,6 +12,15 @@ Estado: trabajo en progreso (WIP).
 
 > astro dev restart
 
+# Mercado Público
+
+Debido a la la cantidad de licitaciones que pueden haber por día
+se incrementó el tamaño máximo que puede enviar una tarea a otro por medio de XCom ([`max_map_length`](https://airflow.apache.org/docs/apache-airflow/stable/configurations-ref.html#max-map-length)).
+
+Por otro lado, ya que la API cuenta con rate limiting (aprox 2 segundos entre consulta), se creó un pool específico para este DAG con el valor de 1, así evito que se ejecuten 2 o más consultas en paralelo.
+
+También para no colapsar la BD (no debería ser un problema en todo caso) se habilitó un xcom storage en GCP.
+
 ## Variables
 
 - Agregar variable `API_MP` con el ticket de MercadoPublico´
@@ -32,6 +41,7 @@ AIRFLOW__CORE__XCOM_BACKEND=airflow.providers.common.io.xcom.backend.XComObjectS
 AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH=gs://my_gcp_conn@<bucket>/xcom
 AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_COMPRESSION=zip
 AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_THRESHOLD=2000
+AIRFLOW__CORE__MAX_MAP_LENGTH=2000
 ```
 
 # Referencias
