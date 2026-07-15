@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "airflow": {
+      "source": "astronomer/agents",
+      "sourceType": "github",
+      "skillPath": "skills/airflow/SKILL.md",
+      "computedHash": "8bc9a6c74897464e1fa8c724d2d82ca0dd9e8b09145c3afc18f4598294a2a0a8"
+    },
+    "airflow-dag-patterns": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "skillPath": "plugins/data-engineering/skills/airflow-dag-patterns/SKILL.md",
+      "computedHash": "86a8bc44c83f01dc9785e0d2bbf0f829db056a2f57945e9f4ce181c728efb2db"
+    }
+  }
+}
