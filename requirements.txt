@@ -2,3 +2,7 @@
 apache-airflow-providers-postgres
 apache-airflow-providers-common-io
 apache-airflow-providers-google
+scrapling[fetchers]==0.4.11
+curl_cffi==0.15.0
+
+astro-run-dag # This package is needed for the astro run command. It will be removed before a deploy
