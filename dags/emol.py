@@ -5,7 +5,7 @@ from scrapling import Fetcher
 from pendulum import datetime
 from datetime import timedelta
 from airflow.sdk import dag, task
-from airflow.exceptions import AirflowSkipException
+from airflow.sdk.exceptions import AirflowSkipException
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
 logger = logging.getLogger(__name__)
@@ -169,6 +169,20 @@ def emol():
                 if tag.get_all_text(strip=True)
             ])
 
+            # Get the comments (only the first )
+            comments = page.css(
+                'div#cont_comment > div.margin_lvl_0 > div.cmt_bubble'
+            )
+            comments_parse = [
+                c.css('div.cmtdata > div.cm_txt_data')[0].text for c in comments
+            ]
+            print(comments_parse)
+
+            # list(map(lambda c: c.css('div.cmtdata > div.cm_txt_data').text, comments))
+
+            # cont_comment > cmt_bubble > > cmt_header > cmtfont > a (nombre usuario)
+            # cont_comment > cmt_bubble > > cmt_data > cm_txt_data (comentario)
+
             return {
                 "id": id,
                 "categoria": categoria,
@@ -202,7 +216,7 @@ def emol():
         """
 
         try:
-            pg_hook = PostgresHook(postgres_conn_id="news_db_con")
+            pg_hook = PostgresHook(postgres_conn_id="airflow_cl_db")
             conn = pg_hook.get_conn()
             cur = conn.cursor()
             cur.execute(
@@ -226,8 +240,9 @@ def emol():
     _extract_news_data = extract_news_data.expand(
         link_data=_flattened_links
     )
-    _save_data = save_data.expand(data=_extract_news_data)
-    _save_data
+    _extract_news_data
+    # _save_data = save_data.expand(data=_extract_news_data)
+    # _save_data
 
 
 emol()
