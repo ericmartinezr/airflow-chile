@@ -6,7 +6,7 @@ from airflow.sdk.exceptions import AirflowSkipException
 
 @pytest.fixture(scope="module")
 def dag():
-    bag = DagBag(dag_folder="dags/", include_examples=False)
+    bag = DagBag(dag_folder="dags/")
     assert "mercado_publico" in bag.dags, (
         f"mercado_publico DAG not loaded. Import errors: {bag.import_errors}"
     )
@@ -43,7 +43,9 @@ class TestDAGStructure:
     def test_dag_default_args(self, dag):
         assert dag.default_args["retries"] == 1
         assert dag.default_args["owner"] == "emartinez"
-        assert dag.default_args["pool"] == "mercadopublico_pool"
+
+    def test_detail_task_uses_pool(self, dag):
+        assert dag.get_task("get_licitacion_detail").pool == "mp_licitacion_detail_pool"
 
 
 class TestTaskFunctions:
