@@ -163,22 +163,31 @@ Dependencias específicas de este DAG (declaradas en `requirements.txt`):
 
 Pipeline que extrae licitaciones publicadas en [Mercado Público](https://www.mercadopublico.cl/) y las almacena en PostgreSQL.
 
+- **Archivo**: `dags/mercado_publico.py`
+- **ID del DAG**: `mercado_publico`
 - **Schedule**: diario (`@daily`)
 - **Fecha de inicio**: 2026-01-01
+- **Zona horaria**: `America/Santiago` (el DAG corre con `catchup=False` y `max_active_runs=1`)
 - **Tags**: `scrapping`, `mercadopublico`
 
 **Flujo general:**
 
 1. Consulta la API de Mercado Público para obtener los códigos de las licitaciones del día anterior.
-2. Por cada código, consulta el detalle completo de la licitación (dynamic task mapping).
-3. Los resultados exitosos se serializan y hacen upsert en PostgreSQL.
-4. Los registros con error se envían a una tabla DLQ (_dead letter queue_) para revisión.
+2. Usa un [loop de TaskFlow](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/loops.html) para procesar una licitación por iteración. Cada iteración conserva en `loop.previous` los códigos restantes y crea únicamente las tareas necesarias para esa iteración.
+3. Consulta el detalle completo de la licitación y aplica un retardo deferrable entre llamadas para respetar el _rate limit_ de la API.
+4. Un `@task.branch` revisa si la consulta terminó con éxito:
+   - Los resultados válidos se serializan y hacen upsert en `mercadopublico_licitacion`.
+   - Los registros con error hacen upsert en `mercadopublico_licitacion_dlq` con su payload y mensaje de error.
+5. Una tarea terminal combina las ramas de cada iteración y entrega los códigos restantes al siguiente ciclo del loop.
 
 **Consideraciones técnicas:**
 
-- Se incrementó [`max_map_length`](https://airflow.apache.org/docs/apache-airflow/stable/configurations-ref.html#max-map-length) a 2000 debido al alto volumen de licitaciones diarias.
-- La API tiene _rate limiting_ (~2 segundos entre consultas), por lo que se creó un pool dedicado con 1 slot para evitar consultas paralelas.
-- Se habilitó un XCom backend en Google Cloud Storage para no sobrecargar la base de datos con datos de XCom.
+- El procesamiento ahora usa la característica **Loops** de Airflow 3.4 en lugar de dynamic task mapping para esta lista de licitaciones. Esto evita crear una instancia mapeada por cada código al cargar el DAG y permite que el mismo grupo se vuelva a ejecutar iterativamente hasta agotar la lista.
+- La llamada al detalle usa un `WaitSensor` de 3 segundos con `deferrable=True` antes de cada consulta y un pool dedicado con un solo slot. Así, las licitaciones se consultan secuencialmente y no saturan la API.
+- Las consultas HTTP usan una sesión con reintentos para respuestas `429`, `500`, `502`, `503` y `504`, backoff y timeout.
+- El branching separa estructuras distintas sin usar `AirflowSkipException`: `prepare_licitacion` genera los campos JSONB del upsert normal, mientras `prepare_licitacion_dlq` genera las claves `codigo_externo`, `error_message` y `payload`.
+- Los upserts son idempotentes: usan `ON CONFLICT (codigo_externo) DO UPDATE`.
+- Las tablas se crean con `dags/sql/mercadopublico/scripts.sql`; las sentencias están en `upsert_licitacion.sql` y `upsert_licitacion_dlq.sql`.
 
 #### Configuración
 
@@ -196,24 +205,24 @@ Pipeline que extrae licitaciones publicadas en [Mercado Público](https://www.me
 
 ##### Conexiones
 
-| Conexión        | Tipo         | Descripción                                     |
-| --------------- | ------------ | ----------------------------------------------- |
-| `airflow_cl_db` | PostgreSQL   | Base de datos destino para las licitaciones     |
-| `my_gcp_conn`   | Google Cloud | Conexión a GCP (usada para XCom backend en GCS) |
+| Conexión        | Tipo       | Descripción                                 |
+| --------------- | ---------- | ------------------------------------------- |
+| `airflow_cl_db` | PostgreSQL | Base de datos destino para las licitaciones |
 
 ##### Variables de ambiente (`.env`)
 
-Configurar las siguientes variables en el archivo `.env` en la raíz del proyecto:
+Este DAG no requiere variables de entorno propias. El ticket de Mercado Público se configura mediante la Variable de Airflow `API_MP`, no dentro de `.env`.
 
 ```ini
-AIRFLOW__CORE__XCOM_BACKEND=airflow.providers.common.io.xcom.backend.XComObjectStorageBackend
-AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH=gs://<conn_id>@<bucket>/xcom
-AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_COMPRESSION=zip
-AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_THRESHOLD=2000
-AIRFLOW__CORE__MAX_MAP_LENGTH=2000
+# Ya no son necesarias para el loop de Mercado Público:
+# AIRFLOW__CORE__XCOM_BACKEND
+# AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_PATH
+# AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_COMPRESSION
+# AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_THRESHOLD
+# AIRFLOW__CORE__MAX_MAP_LENGTH
 ```
 
-Reemplazar `<conn_id>` y `<bucket>` con los valores correspondientes de la conexión GCP y el bucket de GCS.
+> **Nota:** las variables `AIRFLOW__CORE__XCOM_BACKEND`, `AIRFLOW__COMMON_IO__XCOM_OBJECTSTORAGE_*` y `AIRFLOW__CORE__MAX_MAP_LENGTH` ya no son necesarias para este DAG. El procesamiento secuencial con **Loops** ya no crea una tarea mapeada por cada licitación ni requiere ampliar el límite de mapped tasks; además, la información transportada por iteración es un código o un registro pequeño, por lo que no requiere un backend de XCom basado en GCS.
 
 ## Testing
 
