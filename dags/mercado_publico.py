@@ -17,7 +17,8 @@ logger = logging.getLogger(__name__)
 ENDPOINT_LICITACION = "https://api.mercadopublico.cl/servicios/v1/publico/licitaciones.json"
 
 # El endpoint tiene un rate limiter muy estricto: espaciamos las llamadas.
-API_CALL_DELAY_SECONDS = 5
+API_CALL_DELAY_SECONDS = 3
+API_REQUEST_TIMEOUT_SECONDS = 30
 
 
 def _create_api_session() -> requests.Session:
@@ -34,7 +35,7 @@ def _create_api_session() -> requests.Session:
     return session
 
 
-# TODO: XCom backend
+# TODO: implementar un backend de XCom
 # https://www.astronomer.io/docs/learn/custom-xcom-backend-strategies
 # https://www.astronomer.io/docs/learn/custom-xcom-backend-strategies#use-the-object-storage-xcom-backend
 
@@ -42,6 +43,8 @@ def _create_api_session() -> requests.Session:
 @dag(
     start_date=datetime(2026, 1, 1),
     schedule="@daily",
+    catchup=False,
+    max_active_runs=1,
     doc_md=__doc__,
     default_args={
         "owner": "emartinez",
@@ -62,8 +65,8 @@ def mercado_publico():
             yesterday = start_date.subtract(days=1)
             record_date = yesterday.format("DDMMYYYY")
 
-            logger.info(f"Logical date: {start_date}")
-            logger.info(f"Execution date: {record_date}")
+            logger.info("Fecha lógica: %s", start_date)
+            logger.info("Fecha de ejecución: %s", record_date)
 
             ticket = Variable.get("API_MP", None)
             if not ticket:
@@ -74,25 +77,41 @@ def mercado_publico():
                 "ticket": ticket
             }
 
-            r = requests.get(ENDPOINT_LICITACION, params=params)
+            r = _create_api_session().get(
+                ENDPOINT_LICITACION,
+                params=params,
+                timeout=API_REQUEST_TIMEOUT_SECONDS,
+            )
             r.raise_for_status()
-            licitaciones = r.json()["Listado"]
+            listado = r.json().get("Listado")
 
-            # Retorna solo el codigo externo
-            # El detalle es en una tarea siguiente
-            if not licitaciones:
+            if not listado:
                 raise ValueError(
                     f"No existen licitaciones para la fecha {record_date}")
 
-            lista = [x["CodigoExterno"] for x in licitaciones]
+            # Conserva el orden de la API y evita llamadas duplicadas.
+            codes = []
+            seen = set()
+            for licitacion in listado:
+                codigo = licitacion.get("CodigoExterno")
+                if codigo and codigo not in seen:
+                    seen.add(codigo)
+                    codes.append(codigo)
 
-            # TODO: Para probar por el momento
-            return lista
+            if not codes:
+                raise ValueError(
+                    f"La respuesta no contiene CodigoExterno para {record_date}")
+
+            logger.info(
+                "Se encontraron %d licitaciones para %s",
+                len(codes),
+                record_date,
+            )
+            return codes
 
         except Exception as e:
-            logger.error("Error extrayendo licitaciones")
-            logger.error(e, exc_info=True)
-            raise AirflowFailException
+            logger.exception("Error extrayendo licitaciones")
+            raise AirflowFailException(str(e)) from e
 
     @task_group()
     def get_licitacion_detail_loop(licitaciones):
@@ -124,25 +143,26 @@ def mercado_publico():
             Obtiene la licitación a procesar en la iteración actual del loop.
             También retorna la lista de licitaciones restantes para procesar en las siguientes iteraciones.
             """
-            print(f"Loop index: {loop.index}, Loop: {loop}")
-
-            list_licitaciones = []
             if loop.index == 1:
-                list_licitaciones = licitaciones
+                remaining = list(licitaciones)
             else:
-                list_licitaciones = loop.previous.get(
-                    "next_licitaciones") or []
+                remaining = list(loop.previous.get("next_licitaciones") or [])
 
-            licitacion = None
-            if loop.index == 1 and list_licitaciones or loop.index > 1 and list_licitaciones:
-                licitacion = list_licitaciones[0]
+            if not remaining:
+                raise AirflowSkipException("No hay licitaciones pendientes")
 
-            print(
-                f"Processing licitacion {loop.index} of {len(list_licitaciones)} licitaciones")
+            licitacion = remaining[0]
+            next_licitaciones = remaining[1:]
+            logger.info(
+                "Procesando licitación: iteración=%d código=%s restantes=%d",
+                loop.index,
+                licitacion,
+                len(next_licitaciones),
+            )
 
             return {
                 "current_licitacion": licitacion,
-                "next_licitaciones": list_licitaciones[1:] if licitacion else licitaciones
+                "next_licitaciones": next_licitaciones,
             }
 
         @task(
@@ -156,31 +176,37 @@ def mercado_publico():
             Procesa la licitación obtenida en la iteración actual del loop.
             """
             if not data:
-                logger.error("No licitacion to process")
-                raise AirflowSkipException
+                raise AirflowSkipException("No hay una licitación para procesar")
 
             codigo = data.get("current_licitacion")
+            if not codigo:
+                raise AirflowSkipException("No existe el código de la licitación actual")
 
-            logger.info(f"Codigo procesado: {codigo}")
+            logger.info("Código procesado: %s", codigo)
 
-            ticket = Variable.get("API_MP", None)
-            params = {
-                "codigo": codigo,
-                "ticket": ticket
-            }
             r = None
             try:
+                ticket = Variable.get("API_MP", None)
+                if not ticket:
+                    raise ValueError("¡Debes asignar el ticket!")
+
+                params = {
+                    "codigo": codigo,
+                    "ticket": ticket
+                }
                 r = _create_api_session().get(
-                    ENDPOINT_LICITACION, params=params, timeout=30
+                    ENDPOINT_LICITACION,
+                    params=params,
+                    timeout=API_REQUEST_TIMEOUT_SECONDS,
                 )
                 r.raise_for_status()
 
                 licitacion_data = r.json()
 
-                # Error al consultar, conexiones simulteaneas?s
+                # La API puede responder un error dentro de una petición HTTP exitosa.
                 if "Codigo" in licitacion_data and "Mensaje" in licitacion_data:
                     raise ValueError(
-                        f"Error al consultar: \nCodigo: {licitacion_data.get('Codigo')}\n{licitacion_data.get('Mensaje')}"
+                        f"Error al consultar:\nCódigo: {licitacion_data.get('Codigo')}\nMensaje: {licitacion_data.get('Mensaje')}"
                     )
 
                 listado = licitacion_data.get("Listado")
@@ -248,8 +274,10 @@ def mercado_publico():
                 }
             except Exception as e:
                 logger.error(
-                    f"Error extrayendo el detalle de la licitacion {codigo}")
-                logger.exception("Error processing licitacion")
+                    "Error extrayendo el detalle de la licitación %s",
+                    codigo,
+                )
+                logger.exception("Error procesando la licitación")
                 return {
                     "codigo_externo": codigo,
                     "error_message": str(e),
@@ -262,11 +290,7 @@ def mercado_publico():
             """
             Prepara el registro válido para el upsert. Serializa los campos JSONB:
             psycopg no puede adaptar un ``dict`` al placeholder ``%s``.
-            Los registros con error se omiten para que este SQL no se ejecute.
             """
-            if result.get("is_error"):
-                raise AirflowSkipException
-
             prepared = dict(result)
             for field in ("comprador", "adjudicacion", "items", "fechas"):
                 prepared[field] = json.dumps(
@@ -278,16 +302,29 @@ def mercado_publico():
         def prepare_licitacion_dlq(result: dict) -> dict:
             """
             Prepara el registro con error para el upsert de la DLQ, garantizando
-            las tres claves que exige el SQL. Los registros válidos se omiten.
+            las tres claves que exige el SQL.
             """
-            if not result.get("is_error"):
-                raise AirflowSkipException
-
             return {
                 "codigo_externo": result.get("codigo_externo"),
                 "error_message": str(result.get("error_message") or ""),
                 "payload": str(result.get("payload") or ""),
             }
+
+        @task.branch(task_id="seleccionar_upsert")
+        def seleccionar_upsert(result: dict) -> str:
+            """Selecciona el upsert según el resultado de la consulta a la API."""
+            if result.get("is_error"):
+                logger.info(
+                    "Seleccionando DLQ para la licitación %s",
+                    result.get("codigo_externo"),
+                )
+                return "process_licitaciones.prepare_licitacion_dlq"
+
+            logger.info(
+                "Seleccionando upsert válido para la licitación %s",
+                result.get("codigo_externo"),
+            )
+            return "process_licitaciones.prepare_licitacion"
 
         @task(trigger_rule=TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS)
         def iteration_finished(data: dict) -> dict:
@@ -295,11 +332,11 @@ def mercado_publico():
             Única tarea terminal del loop: combina las dos ramas y devuelve el
             resultado de la iteración, que Airflow expone como ``loop.result``.
             """
-            logger.info("Iteration finished")
+            logger.info("Iteración terminada")
             return {"next_licitaciones": data.get("next_licitaciones") or []}
 
         # Sensores de tiempo relativos al inicio de la tarea: a diferencia de
-        # TimeDeltaSensor, espera desde que arranca y no desde el logical date.
+        # TimeDeltaSensor, espera desde que arranca y no desde la fecha lógica.
         # Con deferrable=True libera el worker (Astro Runtime incluye triggerer).
         wait_before_process = WaitSensor(
             task_id="wait_before_process",
@@ -313,12 +350,15 @@ def mercado_publico():
         # El XComArg ya hace que process dependa de get; el sensor se interpone
         # explícitamente para espaciar la llamada a la API.
         _get_licitacion_to_process >> wait_before_process >> _process_licitacion
+        _seleccionar_upsert = seleccionar_upsert(_process_licitacion)
+
+        # La rama seleccionada prepara la estructura correspondiente y ejecuta
+        # únicamente el upsert adecuado. La rama descartada es omitida por Airflow.
         _prepared_licitacion = prepare_licitacion(_process_licitacion)
         _prepared_licitacion_dlq = prepare_licitacion_dlq(_process_licitacion)
+        _seleccionar_upsert >> _prepared_licitacion
+        _seleccionar_upsert >> _prepared_licitacion_dlq
 
-        # Cada rama se decide con un skip (AirflowSkipException): una expansión
-        # vacía omite el SQL correspondiente, incluso dentro de un loop donde
-        # el skip de un BranchPythonOperator no llega a las tareas mapeadas.
         _upsert_licitacion = upsert_licitacion.expand(
             parameters=[_prepared_licitacion]
         )
@@ -335,14 +375,20 @@ def mercado_publico():
     def evaluate_loop(*, loop):
         licitaciones = loop.result.get("next_licitaciones") or []
         if not licitaciones:
-            return LoopDecision(stop=True, reason="All licitaciones processed")
+            return LoopDecision(
+                stop=True,
+                reason="Todas las licitaciones fueron procesadas",
+            )
 
-        return LoopDecision(stop=False, reason="Continue processing licitaciones")
+        return LoopDecision(
+            stop=False,
+            reason="Continuar procesando licitaciones",
+        )
 
     @task
     def finished():
         """Tarea final: todas las licitaciones del día fueron procesadas."""
-        logger.info("All licitaciones processed")
+        logger.info("Todas las licitaciones fueron procesadas")
 
     _get_licitaciones = get_licitaciones()
 

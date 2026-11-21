@@ -1,12 +1,12 @@
 """Tests for the mercado_publico DAG."""
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from airflow.dag_processing.dagbag import DagBag
 from airflow.sdk import TriggerRule
-from airflow.sdk.exceptions import AirflowSkipException
 
 from dags import mercado_publico as mercado_publico_module
 
@@ -28,6 +28,7 @@ EXPECTED_TASKS = {
     f"{GROUP}.get_licitacion_to_process",
     f"{GROUP}.wait_before_process",
     f"{GROUP}.process_licitacion",
+    f"{GROUP}.seleccionar_upsert",
     f"{GROUP}.prepare_licitacion",
     f"{GROUP}.prepare_licitacion_dlq",
     f"{GROUP}.upsert_licitacion",
@@ -82,6 +83,25 @@ class TestDAGStructure:
             )
             assert task.downstream_task_ids == {f"{GROUP}.iteration_finished"}
 
+    def test_branch_selects_preparation_task_by_result(self, dag):
+        fn = dag.get_task(
+            f"{GROUP}.seleccionar_upsert"
+        ).python_callable
+
+        assert fn({"codigo_externo": "123", "is_error": True}) == (
+            f"{GROUP}.prepare_licitacion_dlq"
+        )
+        assert fn({"codigo_externo": "123"}) == (
+            f"{GROUP}.prepare_licitacion"
+        )
+
+    def test_branch_feeds_both_preparation_branches(self, dag):
+        branch = dag.get_task(f"{GROUP}.seleccionar_upsert")
+        assert branch.downstream_task_ids == {
+            f"{GROUP}.prepare_licitacion",
+            f"{GROUP}.prepare_licitacion_dlq",
+        }
+
     def test_loop_has_single_terminal_feeding_the_gate(self, dag):
         group = dag.task_group_dict[GROUP]
         assert [t.task_id for t in group.get_leaves()] == [f"{GROUP}.evaluate_loop"]
@@ -93,14 +113,9 @@ class TestDAGStructure:
         assert dag.get_task(f"{GROUP}.evaluate_loop").downstream_task_ids == {"finished"}
 
 
-class TestSkipGuardsAndTerminal:
+class TestPreparacionYTerminal:
     def _python_callable(self, dag, task_id):
         return dag.get_task(f"{GROUP}.{task_id}").python_callable
-
-    def test_prepare_licitacion_skips_error_records(self, dag):
-        fn = self._python_callable(dag, "prepare_licitacion")
-        with pytest.raises(AirflowSkipException):
-            fn({"codigo_externo": "123", "is_error": True})
 
     def test_prepare_licitacion_serializes_jsonb_fields(self, dag):
         fn = self._python_callable(dag, "prepare_licitacion")
@@ -124,11 +139,6 @@ class TestSkipGuardsAndTerminal:
         result = fn({"codigo_externo": "123"})
         assert json.loads(result["comprador"]) == {}
         assert json.loads(result["fechas"]) == {}
-
-    def test_prepare_licitacion_dlq_skips_valid_records(self, dag):
-        fn = self._python_callable(dag, "prepare_licitacion_dlq")
-        with pytest.raises(AirflowSkipException):
-            fn({"codigo_externo": "123"})
 
     def test_prepare_licitacion_dlq_returns_the_sql_keys(self, dag):
         fn = self._python_callable(dag, "prepare_licitacion_dlq")
@@ -188,8 +198,25 @@ class TestSkipGuardsAndTerminal:
         assert fn({"next_licitaciones": ["a", "b"]}) == {"next_licitaciones": ["a", "b"]}
         assert fn({}) == {"next_licitaciones": []}
 
-    def test_terminal_allows_the_skipped_upsert(self, dag):
+    def test_terminal_permite_el_upsert_descartado(self, dag):
         assert (
             dag.get_task(f"{GROUP}.iteration_finished").trigger_rule
             == TriggerRule.NONE_FAILED_MIN_ONE_SUCCESS
         )
+
+    def test_loop_selector_tracks_remaining_licitaciones(self, dag):
+        fn = self._python_callable(dag, "get_licitacion_to_process")
+        loop = SimpleNamespace(index=1)
+        assert fn(["123", "456"], loop=loop) == {
+            "current_licitacion": "123",
+            "next_licitaciones": ["456"],
+        }
+
+        loop = SimpleNamespace(
+            index=2,
+            previous={"next_licitaciones": ["456", "789"]},
+        )
+        assert fn(["ignored"], loop=loop) == {
+            "current_licitacion": "456",
+            "next_licitaciones": ["789"],
+        }
